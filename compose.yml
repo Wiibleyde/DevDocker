@@ -31,6 +31,9 @@ x-authentik: &authentik
   # Upstream's compose runs the worker as root for the docker socket (outpost
   # auto-deploy). We only use the embedded outpost, so both stay uid 1000.
   user: "1000:1000"
+  read_only: true
+  tmpfs:
+    - /tmp:uid=1000,gid=1000
   shm_size: 512mb
   environment:
     AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?run scripts/init-env.sh}
