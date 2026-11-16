@@ -23,6 +23,7 @@ import os
 import pathlib
 import secrets
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -230,9 +231,24 @@ def check(name: str, ok: bool, detail: object = "") -> bool:
     return ok
 
 
+def wait_for_blueprint(client: Client, timeout: float = 240) -> None:
+    """`compose up --wait` returns once containers are healthy, but the worker
+    applies the blueprint and the embedded outpost loads the Mailpit provider
+    a little later. Both are observable from outside: poll until they are."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        discovery_status, _, _ = client.request("GET", f"{AUTHENTIK}/application/o/rallly/.well-known/openid-configuration")
+        mail_status, _, _ = client.request("GET", f"{MAIL}/")
+        if discovery_status == 200 and mail_status == 302:
+            return
+        time.sleep(5)
+    print(f"blueprint still not applied after {timeout:.0f}s", file=sys.stderr)
+
+
 def main() -> int:
     anon = Client()
     results = []
+    wait_for_blueprint(anon)
 
     status, _, _ = anon.request("GET", f"{AUTHENTIK}/-/health/ready/")
     results.append(check("authentik ready through the proxy", status in (200, 204), status))
