@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """End-to-end check of a running stack, stdlib only (used locally and in CI).
 
-Drives the real flows with the demo accounts instead of a browser:
+Drives the real flows instead of a browser:
   1. every service answers through the proxy
   2. Mailpit is gated by Authentik forward auth
   3. demo-user signs into Rallly through Authentik (OIDC) and gets a session
      carrying the IdP's e-mail
   4. demo-denied (no group) is refused by Authentik's application policy
   5. demo-user (rallly-users) is refused on Mailpit, demo-admin is let in
+  6. akadmin creates a single-use invitation; an external user enrolls with
+     it, lands in rallly-guests and signs into Rallly; the link then stops working
 
-Reads hosts and DEMO_PASSWORD from .env, or from the environment.
+Reads hosts and passwords from .env, overridable from the environment.
 Usage: scripts/smoke-test.py
 """
 
@@ -19,6 +21,7 @@ import http.cookiejar
 import json
 import os
 import pathlib
+import secrets
 import sys
 import urllib.error
 import urllib.parse
@@ -45,7 +48,8 @@ RALLLY = f"{SCHEME}://{ENV.get('RALLLY_HOST', 'rallly.localhost')}"
 AUTHENTIK = f"{SCHEME}://{ENV.get('AUTHENTIK_HOST', 'authentik.localhost')}"
 MAIL = f"{SCHEME}://{ENV.get('MAIL_HOST', 'mail.localhost')}"
 DOMAIN = ENV.get("DEMO_EMAIL_DOMAIN", "devdocker.test")
-PASSWORD = ENV.get("DEMO_PASSWORD") or sys.exit("DEMO_PASSWORD is not set")
+DEMO_PASSWORD = ENV.get("DEMO_PASSWORD") or sys.exit("DEMO_PASSWORD is not set")
+ADMIN_PASSWORD = ENV.get("AUTHENTIK_BOOTSTRAP_PASSWORD") or sys.exit("AUTHENTIK_BOOTSTRAP_PASSWORD is not set")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -95,37 +99,65 @@ class Client:
         raise RuntimeError(f"too many redirects ending at {url}")
 
 
-def run_authentik_flow(client: Client, flow_url: str, username: str) -> dict:
-    """Executes an Authentik flow page through its JSON executor API."""
+def run_authentik_flow(client: Client, flow_url: str, username: str = "", password: str = "", prompt: dict | None = None) -> dict:
+    """Executes an Authentik flow page through its JSON executor API.
+
+    Answers identification/password stages with username/password and prompt
+    stages with `prompt`; returns the first challenge it cannot answer (a
+    redirect, an access-denied stage...).
+    """
     parsed = urllib.parse.urlparse(flow_url)
     slug = parsed.path.rstrip("/").split("/")[-1]
     api = f"{AUTHENTIK}/api/v3/flows/executor/{slug}/?query={urllib.parse.quote(parsed.query)}"
-    _, _, challenge = client.request("GET", api)
+    _, _, challenge = client.follow(api)
     for _ in range(10):
-        component = challenge.get("component")
+        component = (challenge or {}).get("component")
         if component == "ak-stage-identification":
             answer = {"component": component, "uid_field": username}
             if challenge.get("password_fields"):
-                answer["password"] = PASSWORD
+                answer["password"] = password
         elif component == "ak-stage-password":
-            answer = {"component": component, "password": PASSWORD}
-        elif component == "ak-stage-consent":
-            answer = {"component": component, "token": challenge.get("token")}
+            answer = {"component": component, "password": password}
+        elif component == "ak-stage-prompt" and prompt is not None:
+            answer = {"component": component, **prompt}
         else:
-            return challenge
-        _, _, challenge = client.request("POST", api, answer)
+            return challenge or {}
+        status, headers, challenge = client.request("POST", api, answer)
+        if status in (301, 302, 303) and headers.get("Location"):
+            # The executor answers a POST with a redirect to its own GET.
+            _, _, challenge = client.follow(urllib.parse.urljoin(api, headers["Location"]))
     raise RuntimeError(f"flow {slug} did not finish: {challenge}")
 
 
-def login_to_authentik(client: Client, username: str) -> None:
+def login_to_authentik(client: Client, username: str, password: str = DEMO_PASSWORD) -> None:
     url, _, _ = client.follow(f"{AUTHENTIK}/")
-    result = run_authentik_flow(client, url, username)
+    result = run_authentik_flow(client, url, username, password)
     assert result.get("component") == "xak-flow-redirect", f"login of {username} failed: {result}"
 
 
-def rallly_sso(username: str) -> tuple[str, object]:
-    """Returns ("session", user) on success, ("denied", challenge) on refusal."""
-    client = Client()
+def authorize(client: Client, url: str):
+    """Follows an OAuth authorize URL; returns None when Authentik denies it."""
+    url, status, payload = client.follow(url)
+    if url.startswith(AUTHENTIK) and "/if/flow/" in url:
+        # The implicit-consent authorization flow.
+        result = run_authentik_flow(client, url)
+        if result.get("component") == "ak-stage-access-denied":
+            return None
+        assert result.get("component") == "xak-flow-redirect", result
+        url, status, payload = client.follow(result["to"])
+    if url.startswith(AUTHENTIK) and isinstance(payload, str) and "Request has been denied" in payload:
+        # A failed application policy renders the denial page on /authorize itself.
+        return None
+    return url, status, payload
+
+
+def rallly_sso(username: str, password: str = DEMO_PASSWORD, client: Client | None = None) -> tuple[str, object]:
+    """Returns ("session", user) on success, ("denied", None) on refusal.
+
+    Pass a client already signed into Authentik to skip the login step.
+    """
+    signed_in = client is not None
+    client = client or Client()
     status, _, payload = client.request(
         "POST",
         f"{RALLLY}/api/better-auth/sign-in/oauth2",
@@ -133,17 +165,13 @@ def rallly_sso(username: str) -> tuple[str, object]:
         {"Origin": RALLLY},
     )
     assert status == 200 and payload.get("url", "").startswith(AUTHENTIK), (status, payload)
-    authorize = payload["url"]
 
-    login_to_authentik(client, username)
-    url, status, payload = client.follow(authorize)
-    if url.startswith(AUTHENTIK) and "/if/flow/" in url:
-        # Implicit-consent authorization flow, or the access-denied stage.
-        result = run_authentik_flow(client, url, username)
-        if result.get("component") == "ak-stage-access-denied":
-            return "denied", result
-        assert result.get("component") == "xak-flow-redirect", result
-        url, status, payload = client.follow(result["to"])
+    if not signed_in:
+        login_to_authentik(client, username, password)
+    landed = authorize(client, payload["url"])
+    if landed is None:
+        return "denied", None
+    url, status, _ = landed
     assert url.startswith(RALLLY), f"ended at {url} ({status})"
 
     _, _, session = client.request("GET", f"{RALLLY}/api/better-auth/get-session")
@@ -154,13 +182,47 @@ def rallly_sso(username: str) -> tuple[str, object]:
 def mail_access(username: str) -> int:
     client = Client()
     login_to_authentik(client, username)
-    url, status, payload = client.follow(f"{MAIL}/")
-    if url.startswith(AUTHENTIK) and "/if/flow/" in url:
-        result = run_authentik_flow(client, url, username)
-        if result.get("component") == "ak-stage-access-denied":
-            return 403
-        url, status, payload = client.follow(result["to"])
+    landed = authorize(client, f"{MAIL}/")
+    if landed is None:
+        return 403
+    url, status, _ = landed
     return status if url.startswith(MAIL) else 0
+
+
+def create_invitation(email: str) -> str:
+    """Signs in as akadmin and creates a single-use invitation; returns its token."""
+    admin = Client()
+    login_to_authentik(admin, "akadmin", ADMIN_PASSWORD)
+    _, _, flow = admin.request("GET", f"{AUTHENTIK}/api/v3/flows/instances/devdocker-invitation/")
+    status, _, invitation = admin.request(
+        "POST",
+        f"{AUTHENTIK}/api/v3/stages/invitation/invitations/",
+        {
+            "name": f"smoke-{secrets.token_hex(4)}",
+            "flow": flow["pk"],
+            "single_use": True,
+            "fixed_data": {"email": email},
+        },
+        {"Referer": f"{AUTHENTIK}/"},
+    )
+    assert status == 201, (status, invitation)
+    return invitation["pk"]
+
+
+def enroll(token: str, username: str, email: str, password: str) -> tuple[Client, dict]:
+    client = Client()
+    result = run_authentik_flow(
+        client,
+        f"{AUTHENTIK}/if/flow/devdocker-invitation/?itoken={token}",
+        prompt={
+            "username": username,
+            "name": "Smoke Guest",
+            "email": email,
+            "password": password,
+            "password_repeat": password,
+        },
+    )
+    return client, result
 
 
 def check(name: str, ok: bool, detail: object = "") -> bool:
@@ -176,7 +238,7 @@ def main() -> int:
     results.append(check("authentik ready through the proxy", status in (200, 204), status))
 
     _, _, discovery = anon.request("GET", f"{AUTHENTIK}/application/o/rallly/.well-known/openid-configuration")
-    issuer = (discovery or {}).get("issuer") if isinstance(discovery, dict) else None
+    issuer = discovery.get("issuer") if isinstance(discovery, dict) else None
     results.append(check("OIDC issuer is the public URL", issuer == f"{AUTHENTIK}/application/o/rallly/", issuer))
 
     status, _, _ = anon.request("GET", f"{RALLLY}/api/status")
@@ -194,6 +256,19 @@ def main() -> int:
 
     results.append(check("demo-user is refused on Mailpit", mail_access("demo-user") == 403))
     results.append(check("demo-admin reaches Mailpit", mail_access("demo-admin") == 200))
+
+    guest = f"guest-{secrets.token_hex(4)}"
+    guest_email = f"{guest}@external.test"
+    guest_password = secrets.token_urlsafe(18)
+    token = create_invitation(guest_email)
+    client, result = enroll(token, guest, guest_email, guest_password)
+    results.append(check("external user enrolls with the invitation", result.get("component") == "xak-flow-redirect", result))
+
+    outcome, user = rallly_sso(guest, client=client)
+    results.append(check("invited guest signs into Rallly", outcome == "session" and user.get("email") == guest_email, user))
+
+    _, result = enroll(token, f"{guest}-again", f"again-{guest_email}", guest_password)
+    results.append(check("single-use invitation cannot be replayed", result.get("component") != "xak-flow-redirect", result))
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1

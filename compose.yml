@@ -222,10 +222,11 @@ services:
     tmpfs:
       - /tmp
       # npx (used by the start script for `prisma migrate deploy`) writes its
-      # cache and logs under $HOME=/app.
-      - /app/.npm:uid=999,gid=999
-      - /app/.cache:uid=999,gid=999
-      - /app/apps/web/.next/cache:uid=999,gid=999
+      # cache and logs under $HOME=/app. uid 100 / gid 101 = nextjs:nodejs in
+      # the image (adduser --system).
+      - /app/.npm:uid=100,gid=101
+      - /app/.cache:uid=100,gid=101
+      - /app/apps/web/.next/cache:uid=100,gid=101
     environment:
       DATABASE_URL: postgres://rallly:${RALLLY_DB_PASSWORD}@rallly-db:5432/rallly
       SECRET_PASSWORD: ${RALLLY_SECRET_PASSWORD:?run scripts/init-env.sh}
