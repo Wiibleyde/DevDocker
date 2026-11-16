@@ -54,6 +54,7 @@ lui seul, à se promouvoir admin de l'instance Rallly : une fois, via
 | `rallly-admins` | ✅ (admin d'instance) | ✅ | `demo-admin` |
 | `rallly-users` | ✅ | ❌ | `demo-user` |
 | `rallly-guests` | ✅ | ❌ | utilisateurs créés par invitation |
+| `authentik Admins` | ✅ | ✅ | `akadmin` (le statut superuser ne contourne pas les policies d'application) |
 | *(aucun)* | ❌ | ❌ | `demo-denied` |
 
 Chaque application a des **policy bindings de groupe** et le mode `any` : un

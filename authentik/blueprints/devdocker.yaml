@@ -5,10 +5,11 @@
 # Values that differ between local and VPS come from the DEVDOCKER_* variables
 # set in compose.yml.
 #
-#   Groups        rallly-admins  -> Rallly (instance admin) + Mailpit
-#                 rallly-users   -> Rallly
-#                 rallly-guests  -> Rallly (external users, via invitation)
-#                 (no group)     -> refused everywhere
+#   Groups        rallly-admins     -> Rallly (instance admin) + Mailpit
+#                 rallly-users      -> Rallly
+#                 rallly-guests     -> Rallly (external users, via invitation)
+#                 authentik Admins  -> Rallly + Mailpit (akadmin)
+#                 (no group)        -> refused everywhere
 #   Rallly        OAuth2/OIDC provider, confidential client, PKCE on Rallly's side
 #   Mailpit       Proxy provider (forward auth) on the embedded outpost
 #   Invitation    devdocker-invitation enrollment flow -> rallly-guests
@@ -150,6 +151,15 @@ entries:
     attrs:
       order: 20
 
+  # Superuser status does not bypass application policies: without this
+  # binding akadmin gets "Permission denied" on its own apps.
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-rallly
+      group: !Find [authentik_core.group, [name, authentik Admins]]
+    attrs:
+      order: 30
+
   # --- Mailpit: forward auth -------------------------------------------------
   - model: authentik_providers_proxy.proxyprovider
     id: provider-mailpit
@@ -178,6 +188,13 @@ entries:
       group: !KeyOf group-admins
     attrs:
       order: 0
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-mailpit
+      group: !Find [authentik_core.group, [name, authentik Admins]]
+    attrs:
+      order: 10
 
   # The embedded outpost runs inside authentik-server. It must know the public
   # Authentik URL to send browsers there; without authentik_host the redirect

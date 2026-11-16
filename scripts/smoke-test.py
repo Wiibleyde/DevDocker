@@ -159,12 +159,18 @@ def rallly_sso(username: str, password: str = DEMO_PASSWORD, client: Client | No
     """
     signed_in = client is not None
     client = client or Client()
-    status, _, payload = client.request(
-        "POST",
-        f"{RALLLY}/api/better-auth/sign-in/oauth2",
-        {"providerId": "oidc", "callbackURL": "/"},
-        {"Origin": RALLLY},
-    )
+    for _ in range(6):
+        status, headers, payload = client.request(
+            "POST",
+            f"{RALLLY}/api/better-auth/sign-in/oauth2",
+            {"providerId": "oidc", "callbackURL": "/"},
+            {"Origin": RALLLY},
+        )
+        if status != 429:
+            break
+        # Better Auth rate-limits sign-in per client IP; this script signs in
+        # several users from one address within seconds.
+        time.sleep(int(headers.get("X-Retry-After") or headers.get("Retry-After") or 10))
     assert status == 200 and payload.get("url", "").startswith(AUTHENTIK), (status, payload)
 
     if not signed_in:
@@ -269,6 +275,9 @@ def main() -> int:
 
     outcome, detail = rallly_sso("demo-denied")
     results.append(check("demo-denied is refused by the Rallly policy", outcome == "denied", detail))
+
+    outcome, user = rallly_sso("akadmin", ADMIN_PASSWORD)
+    results.append(check("akadmin (authentik Admins) signs into Rallly", outcome == "session", user))
 
     results.append(check("demo-user is refused on Mailpit", mail_access("demo-user") == 403))
     results.append(check("demo-admin reaches Mailpit", mail_access("demo-admin") == 200))
