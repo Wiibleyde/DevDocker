@@ -1,0 +1,133 @@
+name: CI
+
+# lint     compose (local + VPS variants) and Caddyfile parse with a fresh .env
+# scan     Trivy: IaC misconfigurations of this repo + CVEs of every image used
+# e2e      boots the whole stack on the runner and runs scripts/smoke-test.py
+#          (SSO, group policies, forward auth) against it
+# deploy   main only: SSH to the VPS, whose key can only run deploy.sh
+#
+# The Rallly image itself is built in the fork (Wiibleyde/rallly,
+# .github/workflows/devdocker-image.yml); this pipeline consumes it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint compose & Caddyfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate compose (local)
+        run: |
+          scripts/init-env.sh
+          docker compose config --quiet
+          rm .env
+
+      - name: Validate compose (VPS)
+        run: |
+          scripts/init-env.sh vps example.org
+          docker compose config --quiet
+          rm .env
+
+      - name: Validate Caddyfile
+        run: |
+          docker run --rm -v "$PWD/caddy:/etc/caddy:ro" \
+            -e RALLLY_HOST=rallly.localhost -e AUTHENTIK_HOST=authentik.localhost -e MAIL_HOST=mail.localhost \
+            caddy:2.11-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+  scan:
+    name: Trivy scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Gate: a HIGH/CRITICAL misconfiguration in compose/Dockerfiles fails CI.
+      - name: IaC misconfigurations
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          skip-dirs: rallly
+
+      # Report only, commented in docs/security.md: these are upstream images,
+      # the lever we have is bumping the tag, not patching them.
+      - name: Image CVEs (report)
+        run: |
+          scripts/init-env.sh >/dev/null
+          images=$(docker compose config --images | sort -u)
+          rm .env
+          {
+            echo '## Trivy — HIGH/CRITICAL CVEs with a fix available'
+            for image in $images; do
+              echo "### \`$image\`"
+              echo '```'
+              docker run --rm aquasec/trivy:0.76.2 image --quiet --scanners vuln \
+                --severity HIGH,CRITICAL --ignore-unfixed --format table "$image" \
+                | tail -n +2 || echo "scan failed"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: End-to-end (SSO, policies, forward auth)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start the stack
+        run: |
+          scripts/init-env.sh >/dev/null
+          docker compose pull --quiet
+          docker compose up -d --no-build --wait --wait-timeout 300
+
+      - name: Smoke test
+        run: scripts/smoke-test.py
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose ps -a && docker compose logs --tail 80
+
+  deploy:
+    name: Deploy to VPS
+    needs: [lint, scan, e2e]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://rallly.wiibleyde.dev
+    concurrency:
+      group: devdocker-deploy
+      cancel-in-progress: false
+    steps:
+      # The key is pinned server-side to `command="…/deploy.sh",restrict`: it
+      # can trigger a redeploy and nothing else, whatever this step sends.
+      - name: Trigger deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+          SSH_TARGET: ${{ secrets.DEPLOY_SSH_TARGET }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then
+            echo "::notice::DEPLOY_SSH_KEY is not set on this repository; skipping deploy"
+            exit 0
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -o BatchMode=yes "$SSH_TARGET" deploy

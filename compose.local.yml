@@ -1,0 +1,28 @@
+# Local override (COMPOSE_FILE=compose.yml:compose.local.yml in .env).
+
+services:
+  devdocker-proxy:
+    ports:
+      # Port 80 is load-bearing, not a default: the hostnames below resolve to
+      # this container from inside the stack too, and Rallly calls the issuer
+      # URL on :80. Publishing on another host port breaks the OIDC login.
+      - "127.0.0.1:80:80"
+    networks:
+      ingress: {}
+      apps:
+        # Browsers resolve *.localhost to 127.0.0.1 natively; containers do
+        # not. These aliases make Rallly's server-side OIDC discovery reach
+        # the same Authentik URL the browser uses, so the issuer matches.
+        aliases:
+          - ${RALLLY_HOST:-rallly.localhost}
+          - ${AUTHENTIK_HOST:-authentik.localhost}
+          - ${MAIL_HOST:-mail.localhost}
+
+  rallly:
+    # `docker compose up` pulls the CI image; `docker compose build rallly`
+    # builds the ./rallly submodule instead, to try a feature before pushing.
+    build:
+      context: ./rallly
+      dockerfile: apps/web/Dockerfile
+      args:
+        SELF_HOSTED: "true"

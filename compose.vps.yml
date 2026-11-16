@@ -1,0 +1,18 @@
+# VPS override (COMPOSE_FILE=compose.yml:compose.vps.yml in .env).
+#
+# The VPS already runs a shared Caddy that owns :80/:443 and terminates TLS.
+# Instead of publishing a port, this stack's proxy joins that Caddy's `front`
+# network and receives plain HTTP for rallly., authentik. and mail.<domain>.
+# Same proxy, same Caddyfile, same images as local: only the entry differs.
+
+services:
+  devdocker-proxy:
+    networks:
+      ingress: {}
+      apps: {}
+      front: {}
+
+networks:
+  front:
+    external: true
+    name: front

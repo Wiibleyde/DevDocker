@@ -1,0 +1,324 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Everything DevDocker needs in Authentik, applied by the worker at boot and
+# re-applied whenever this file changes (mounted at /blueprints/custom).
+# Values that differ between local and VPS come from the DEVDOCKER_* variables
+# set in compose.yml.
+#
+#   Groups        rallly-admins  -> Rallly (instance admin) + Mailpit
+#                 rallly-users   -> Rallly
+#                 rallly-guests  -> Rallly (external users, via invitation)
+#                 (no group)     -> refused everywhere
+#   Rallly        OAuth2/OIDC provider, confidential client, PKCE on Rallly's side
+#   Mailpit       Proxy provider (forward auth) on the embedded outpost
+#   Invitation    devdocker-invitation enrollment flow -> rallly-guests
+#   Demo users    demo-admin, demo-user, demo-denied (password: DEMO_PASSWORD)
+version: 1
+metadata:
+  name: DevDocker
+  labels:
+    blueprints.goauthentik.io/description: Rallly SSO, group policies, Mailpit gate, external invitations, demo accounts
+entries:
+  # --- Groups ----------------------------------------------------------------
+  - model: authentik_core.group
+    id: group-admins
+    identifiers:
+      name: rallly-admins
+    attrs:
+      is_superuser: false
+      attributes:
+        description: Rallly instance admins; also reach the Mailpit inbox
+
+  - model: authentik_core.group
+    id: group-users
+    identifiers:
+      name: rallly-users
+    attrs:
+      is_superuser: false
+      attributes:
+        description: Internal users allowed into Rallly
+
+  - model: authentik_core.group
+    id: group-guests
+    identifiers:
+      name: rallly-guests
+    attrs:
+      is_superuser: false
+      attributes:
+        description: External users enrolled through an invitation; Rallly only
+
+  # --- Demo accounts ---------------------------------------------------------
+  # `state: created`: the password is set once. Changing it in the UI during a
+  # demo survives the next blueprint run instead of being reset.
+  - model: authentik_core.user
+    state: created
+    identifiers:
+      username: demo-admin
+    attrs:
+      name: Demo Admin
+      email: !Format ["demo-admin@%s", !Env DEVDOCKER_DEMO_EMAIL_DOMAIN]
+      path: users/devdocker
+      type: internal
+      password: !Env DEVDOCKER_DEMO_PASSWORD
+      groups:
+        - !KeyOf group-admins
+
+  - model: authentik_core.user
+    state: created
+    identifiers:
+      username: demo-user
+    attrs:
+      name: Demo User
+      email: !Format ["demo-user@%s", !Env DEVDOCKER_DEMO_EMAIL_DOMAIN]
+      path: users/devdocker
+      type: internal
+      password: !Env DEVDOCKER_DEMO_PASSWORD
+      groups:
+        - !KeyOf group-users
+
+  - model: authentik_core.user
+    state: created
+    identifiers:
+      username: demo-denied
+    attrs:
+      name: Demo Denied
+      email: !Format ["demo-denied@%s", !Env DEVDOCKER_DEMO_EMAIL_DOMAIN]
+      path: users/devdocker
+      type: internal
+      password: !Env DEVDOCKER_DEMO_PASSWORD
+
+  # --- Rallly: OIDC ----------------------------------------------------------
+  - model: authentik_providers_oauth2.oauth2provider
+    id: provider-rallly
+    identifiers:
+      name: Rallly
+    attrs:
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      client_type: confidential
+      client_id: !Env DEVDOCKER_RALLLY_CLIENT_ID
+      client_secret: !Env DEVDOCKER_RALLLY_CLIENT_SECRET
+      redirect_uris:
+        # Rallly builds it from NEXT_PUBLIC_BASE_URL (genericOAuth providerId "oidc").
+        - matching_mode: strict
+          url: !Format ["%s/api/auth/callback/oidc", !Env DEVDOCKER_RALLLY_URL]
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
+      sub_mode: hashed_user_id
+      include_claims_in_id_token: true
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-email]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-profile]]
+
+  - model: authentik_core.application
+    id: app-rallly
+    identifiers:
+      slug: rallly
+    attrs:
+      name: Rallly
+      provider: !KeyOf provider-rallly
+      meta_launch_url: !Env DEVDOCKER_RALLLY_URL
+      meta_description: Planification de réunions (fork DevDocker)
+      # Any one binding passing grants access; a user in none of the three
+      # groups (demo-denied) gets "Permission denied" from Authentik and never
+      # reaches Rallly's callback.
+      policy_engine_mode: any
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-rallly
+      group: !KeyOf group-admins
+    attrs:
+      order: 0
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-rallly
+      group: !KeyOf group-users
+    attrs:
+      order: 10
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-rallly
+      group: !KeyOf group-guests
+    attrs:
+      order: 20
+
+  # --- Mailpit: forward auth -------------------------------------------------
+  - model: authentik_providers_proxy.proxyprovider
+    id: provider-mailpit
+    identifiers:
+      name: Mailpit
+    attrs:
+      mode: forward_single
+      external_host: !Env DEVDOCKER_MAIL_URL
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+
+  - model: authentik_core.application
+    id: app-mailpit
+    identifiers:
+      slug: mailpit
+    attrs:
+      name: Mailpit
+      provider: !KeyOf provider-mailpit
+      meta_launch_url: !Env DEVDOCKER_MAIL_URL
+      meta_description: Boîte mail de lab (SMTP de Rallly et Authentik)
+      policy_engine_mode: any
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-mailpit
+      group: !KeyOf group-admins
+    attrs:
+      order: 0
+
+  # The embedded outpost runs inside authentik-server. It must know the public
+  # Authentik URL to send browsers there; without authentik_host the redirect
+  # targets the internal address.
+  - model: authentik_outposts.outpost
+    identifiers:
+      managed: goauthentik.io/outposts/embedded
+    attrs:
+      providers:
+        - !KeyOf provider-mailpit
+      config:
+        authentik_host: !Env DEVDOCKER_AUTHENTIK_URL
+        authentik_host_insecure: false
+
+  # --- External invitation ---------------------------------------------------
+  # An admin creates an invitation for this flow (Directory > Invitations),
+  # optionally pinning the e-mail in fixed_data, and sends the link
+  # <authentik>/if/flow/devdocker-invitation/?itoken=<uuid>. Without a valid
+  # token the flow stops at the first stage.
+  - model: authentik_flows.flow
+    id: flow-invitation
+    identifiers:
+      slug: devdocker-invitation
+    attrs:
+      name: DevDocker invitation enrollment
+      title: Rejoindre DevDocker
+      designation: enrollment
+      authentication: require_unauthenticated
+
+  - model: authentik_stages_invitation.invitationstage
+    id: stage-invitation
+    identifiers:
+      name: devdocker-invitation
+    attrs:
+      continue_flow_without_invitation: false
+
+  - model: authentik_stages_prompt.prompt
+    id: field-username
+    identifiers:
+      name: devdocker-invitation-username
+    attrs:
+      field_key: username
+      label: Nom d'utilisateur
+      type: username
+      required: true
+      placeholder: Nom d'utilisateur
+      order: 0
+
+  - model: authentik_stages_prompt.prompt
+    id: field-name
+    identifiers:
+      name: devdocker-invitation-name
+    attrs:
+      field_key: name
+      label: Nom complet
+      type: text
+      required: true
+      placeholder: Nom complet
+      order: 10
+
+  - model: authentik_stages_prompt.prompt
+    id: field-email
+    identifiers:
+      name: devdocker-invitation-email
+    attrs:
+      field_key: email
+      label: E-mail
+      type: email
+      required: true
+      placeholder: E-mail
+      order: 20
+
+  - model: authentik_stages_prompt.prompt
+    id: field-password
+    identifiers:
+      name: devdocker-invitation-password
+    attrs:
+      field_key: password
+      label: Mot de passe
+      type: password
+      required: true
+      placeholder: Mot de passe
+      order: 30
+
+  - model: authentik_stages_prompt.prompt
+    id: field-password-repeat
+    identifiers:
+      name: devdocker-invitation-password-repeat
+    attrs:
+      field_key: password_repeat
+      label: Mot de passe (confirmation)
+      type: password
+      required: true
+      placeholder: Mot de passe (confirmation)
+      order: 40
+
+  - model: authentik_stages_prompt.promptstage
+    id: stage-prompt
+    identifiers:
+      name: devdocker-invitation-prompt
+    attrs:
+      fields:
+        - !KeyOf field-username
+        - !KeyOf field-name
+        - !KeyOf field-email
+        - !KeyOf field-password
+        - !KeyOf field-password-repeat
+
+  - model: authentik_stages_user_write.userwritestage
+    id: stage-user-write
+    identifiers:
+      name: devdocker-invitation-write
+    attrs:
+      user_creation_mode: always_create
+      user_type: external
+      user_path_template: users/guests
+      create_users_group: !KeyOf group-guests
+
+  - model: authentik_stages_user_login.userloginstage
+    id: stage-login
+    identifiers:
+      name: devdocker-invitation-login
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf flow-invitation
+      stage: !KeyOf stage-invitation
+      order: 0
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: true
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf flow-invitation
+      stage: !KeyOf stage-prompt
+      order: 10
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf flow-invitation
+      stage: !KeyOf stage-user-write
+      order: 20
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf flow-invitation
+      stage: !KeyOf stage-login
+      order: 30

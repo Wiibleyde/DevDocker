@@ -1,0 +1,53 @@
+{
+	# TLS belongs to whatever sits in front: nothing locally (http://*.localhost),
+	# the VPS edge Caddy in the cloud. Without this Caddy would try ACME.
+	auto_https off
+	http_port 80
+
+	servers {
+		# On the VPS the edge Caddy is the client. Trusting private ranges keeps
+		# its X-Forwarded-Proto: https and the visitor's address intact on the
+		# way to Authentik, which builds its redirect URLs from them.
+		trusted_proxies static private_ranges
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+(headers) {
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+http://{$AUTHENTIK_HOST} {
+	import headers
+	reverse_proxy authentik-server:9000
+}
+
+http://{$RALLLY_HOST} {
+	import headers
+	reverse_proxy rallly:3000
+}
+
+# Mailpit has no authentication of its own. Authentik's embedded outpost gates
+# it (proxy provider "Mailpit", forward auth single application), and the
+# application's policy lets only the rallly-admins group through.
+http://{$MAIL_HOST} {
+	import headers
+
+	route {
+		# The outpost's own endpoints (sign-in callback, sign-out) must reach
+		# Authentik before forward_auth runs, or the callback loops.
+		reverse_proxy /outpost.goauthentik.io/* authentik-server:9000
+
+		forward_auth authentik-server:9000 {
+			uri /outpost.goauthentik.io/auth/caddy
+			copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+			trusted_proxies private_ranges
+		}
+
+		reverse_proxy mailpit:8025
+	}
+}

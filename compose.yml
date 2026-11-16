@@ -1,0 +1,274 @@
+# DevDocker — Caddy + Authentik (OIDC) + Rallly, one stack for local and VPS.
+#
+# This file is shared by both environments. What differs lives in an override
+# selected by COMPOSE_FILE in .env:
+#   compose.local.yml  publishes :80, gives the proxy the *.localhost names
+#                      inside the stack, builds Rallly from the ./rallly fork
+#   compose.vps.yml    attaches the proxy to the VPS edge network instead
+#
+# Networks are split so that each database is only reachable by its own app:
+#   ingress           proxy only; the one network with a published port (local)
+#   apps      internal proxy <-> authentik-server, rallly, mailpit UI
+#   authentik internal authentik-server/worker <-> authentik-db, mailpit SMTP
+#   rallly    internal rallly <-> rallly-db, garage, mailpit SMTP
+#   egress            rallly only: OIDC discovery against the public issuer URL
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-authentik: &authentik
+  <<: *hardening
+  image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:-2026.8.5}
+  # Upstream's compose runs the worker as root for the docker socket (outpost
+  # auto-deploy). We only use the embedded outpost, so both stay uid 1000.
+  user: "1000:1000"
+  shm_size: 512mb
+  environment:
+    AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?run scripts/init-env.sh}
+    AUTHENTIK_POSTGRESQL__HOST: authentik-db
+    AUTHENTIK_POSTGRESQL__NAME: authentik
+    AUTHENTIK_POSTGRESQL__USER: authentik
+    AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD:?run scripts/init-env.sh}
+    AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:?run scripts/init-env.sh}
+    AUTHENTIK_BOOTSTRAP_EMAIL: admin@${DEMO_EMAIL_DOMAIN:-devdocker.test}
+    AUTHENTIK_EMAIL__HOST: mailpit
+    AUTHENTIK_EMAIL__PORT: 1025
+    AUTHENTIK_EMAIL__USE_TLS: "false"
+    AUTHENTIK_EMAIL__USE_SSL: "false"
+    AUTHENTIK_EMAIL__FROM: authentik@${DEMO_EMAIL_DOMAIN:-devdocker.test}
+    AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+    AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+    # Read by authentik/blueprints/devdocker.yaml through !Env. The worker is
+    # the one that applies blueprints, but the server validates them too.
+    DEVDOCKER_RALLLY_URL: ${PUBLIC_SCHEME:-http}://${RALLLY_HOST:-rallly.localhost}
+    DEVDOCKER_AUTHENTIK_URL: ${PUBLIC_SCHEME:-http}://${AUTHENTIK_HOST:-authentik.localhost}
+    DEVDOCKER_MAIL_URL: ${PUBLIC_SCHEME:-http}://${MAIL_HOST:-mail.localhost}
+    DEVDOCKER_RALLLY_CLIENT_ID: ${RALLLY_OIDC_CLIENT_ID:-rallly}
+    DEVDOCKER_RALLLY_CLIENT_SECRET: ${RALLLY_OIDC_CLIENT_SECRET:?run scripts/init-env.sh}
+    DEVDOCKER_DEMO_PASSWORD: ${DEMO_PASSWORD:?run scripts/init-env.sh}
+    DEVDOCKER_DEMO_EMAIL_DOMAIN: ${DEMO_EMAIL_DOMAIN:-devdocker.test}
+  volumes:
+    - authentik_data:/data
+    - ./authentik/blueprints:/blueprints/custom:ro
+  depends_on:
+    authentik-db:
+      condition: service_healthy
+
+services:
+  devdocker-proxy:
+    <<: *hardening
+    image: caddy:${CADDY_TAG:-2.11-alpine}
+    user: "1000:1000"
+    read_only: true
+    environment:
+      RALLLY_HOST: ${RALLLY_HOST:-rallly.localhost}
+      AUTHENTIK_HOST: ${AUTHENTIK_HOST:-authentik.localhost}
+      MAIL_HOST: ${MAIL_HOST:-mail.localhost}
+    volumes:
+      # The directory, not the file: a single-file mount pins the inode and
+      # `caddy reload` then keeps serving the old content.
+      - ./caddy:/etc/caddy:ro
+    # auto_https is off (TLS is the host's or the edge's job), so nothing in
+    # /data or /config has to survive a restart.
+    tmpfs:
+      - /data:uid=1000,gid=1000
+      - /config:uid=1000,gid=1000
+    networks: [ingress, apps]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 128m
+
+  authentik-db:
+    <<: *hardening
+    image: postgres:${POSTGRES_TAG:-18-alpine}
+    # uid 70 = postgres in the alpine image. Starting as that user directly
+    # skips the entrypoint's root chown, which is what lets cap_drop ALL hold.
+    user: "70:70"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:uid=70,gid=70
+      - /tmp:uid=70,gid=70
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${AUTHENTIK_DB_PASSWORD:?run scripts/init-env.sh}
+    volumes:
+      # Postgres 18 keeps PGDATA under /var/lib/postgresql/18/docker; the old
+      # .../data mount point makes the image refuse to start.
+      - authentik_db:/var/lib/postgresql
+    networks: [authentik]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik -d authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 384m
+
+  authentik-server:
+    <<: *authentik
+    command: server
+    networks: [apps, authentik]
+    mem_limit: 1g
+
+  authentik-worker:
+    <<: *authentik
+    command: worker
+    networks: [authentik]
+    mem_limit: 1g
+
+  rallly-db:
+    <<: *hardening
+    image: postgres:${POSTGRES_TAG:-18-alpine}
+    user: "70:70"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:uid=70,gid=70
+      - /tmp:uid=70,gid=70
+    environment:
+      POSTGRES_DB: rallly
+      POSTGRES_USER: rallly
+      POSTGRES_PASSWORD: ${RALLLY_DB_PASSWORD:?run scripts/init-env.sh}
+    volumes:
+      - rallly_db:/var/lib/postgresql
+    networks: [rallly]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rallly -d rallly"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 384m
+
+  # Named volumes start root-owned and the garage image is FROM scratch (no
+  # shell, no user), so a one-shot hands the two directories to uid 1000
+  # before garage starts as that uid.
+  garage-perms:
+    image: alpine:${ALPINE_TAG:-3.22}
+    restart: "no"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: [no-new-privileges:true]
+    command: ["chown", "1000:1000", "/var/lib/garage/meta", "/var/lib/garage/data"]
+    volumes:
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+
+  garage:
+    <<: *hardening
+    image: dxflrs/garage:${GARAGE_TAG:-v2.5.0}
+    user: "1000:1000"
+    read_only: true
+    # --default-bucket creates the bucket and the key below on first boot:
+    # no `garage layout` / `bucket create` to run by hand.
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_CONFIG_FILE: /etc/garage/garage.toml
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?run scripts/init-env.sh}
+      GARAGE_DEFAULT_ACCESS_KEY: ${S3_ACCESS_KEY_ID:?run scripts/init-env.sh}
+      GARAGE_DEFAULT_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:?run scripts/init-env.sh}
+      GARAGE_DEFAULT_BUCKET: rallly
+    volumes:
+      - ./garage:/etc/garage:ro
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+    networks: [rallly]
+    depends_on:
+      garage-perms:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/garage", "bucket", "info", "rallly"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 256m
+
+  mailpit:
+    <<: *hardening
+    image: axllent/mailpit:${MAILPIT_TAG:-v1.33.1}
+    user: "1000:1000"
+    read_only: true
+    # No MP_DATABASE: mail lives in a temp file under /tmp and is gone on
+    # restart, which is what a lab inbox should do.
+    tmpfs:
+      - /tmp:uid=1000,gid=1000
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    networks: [apps, authentik, rallly]
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 128m
+
+  rallly:
+    <<: *hardening
+    image: ghcr.io/wiibleyde/rallly:${RALLLY_TAG:-main}
+    read_only: true
+    tmpfs:
+      - /tmp
+      # npx (used by the start script for `prisma migrate deploy`) writes its
+      # cache and logs under $HOME=/app.
+      - /app/.npm:uid=999,gid=999
+      - /app/.cache:uid=999,gid=999
+      - /app/apps/web/.next/cache:uid=999,gid=999
+    environment:
+      DATABASE_URL: postgres://rallly:${RALLLY_DB_PASSWORD}@rallly-db:5432/rallly
+      SECRET_PASSWORD: ${RALLLY_SECRET_PASSWORD:?run scripts/init-env.sh}
+      NEXT_PUBLIC_BASE_URL: ${PUBLIC_SCHEME:-http}://${RALLLY_HOST:-rallly.localhost}
+      SUPPORT_EMAIL: support@${DEMO_EMAIL_DOMAIN:-devdocker.test}
+      NOREPLY_EMAIL: noreply@${DEMO_EMAIL_DOMAIN:-devdocker.test}
+      INITIAL_ADMIN_EMAIL: demo-admin@${DEMO_EMAIL_DOMAIN:-devdocker.test}
+      # Authentik is the only way in: with e-mail login off, Rallly redirects
+      # /login straight to the IdP, so group policies cannot be bypassed.
+      EMAIL_LOGIN_ENABLED: "false"
+      OIDC_NAME: Authentik
+      OIDC_DISCOVERY_URL: ${PUBLIC_SCHEME:-http}://${AUTHENTIK_HOST:-authentik.localhost}/application/o/rallly/.well-known/openid-configuration
+      OIDC_CLIENT_ID: ${RALLLY_OIDC_CLIENT_ID:-rallly}
+      OIDC_CLIENT_SECRET: ${RALLLY_OIDC_CLIENT_SECRET:?run scripts/init-env.sh}
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "false"
+      S3_ENDPOINT: http://garage:3900
+      S3_REGION: garage
+      S3_BUCKET_NAME: rallly
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+    networks: [apps, rallly, egress]
+    depends_on:
+      rallly-db:
+        condition: service_healthy
+      garage:
+        condition: service_healthy
+    mem_limit: 768m
+
+volumes:
+  authentik_db:
+  authentik_data:
+  rallly_db:
+  garage_meta:
+  garage_data:
+
+networks:
+  ingress:
+  egress:
+  apps:
+    internal: true
+  authentik:
+    internal: true
+  rallly:
+    internal: true
